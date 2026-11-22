@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MHT → HTML</title>
+<style>
+  body{font-family:system-ui,sans-serif;max-width:560px;margin:24px auto;padding:16px;background:#f5f5f5;color:#222}
+  .box{background:#fff;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,.08)}
+  h1{font-size:18px;margin:0 0 12px}
+  label{display:block;margin:12px 0 4px;font-size:14px}
+  input[type=file],select{width:100%;padding:10px;margin:4px 0;font-size:16px;box-sizing:border-box}
+  button{width:100%;background:#0066cc;color:#fff;border:none;padding:14px;border-radius:8px;font-size:16px;cursor:pointer;margin-top:12px}
+  button:disabled{background:#ccc}
+  .status{margin-top:14px;padding:10px;border-radius:6px;font-size:14px;display:none}
+  .status.info{background:#e3f2fd;display:block}
+  .status.ok{background:#e8f5e9;display:block}
+  .status.err{background:#ffebee;display:block}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>تحويل MHT / MHTML إلى HTML</h1>
+  <label>طريقة التحويل:</label>
+  <select id="mode">
+    <option value="single">HTML واحد (كل الصور والـ CSS مدمجة)</option>
+    <option value="plain">HTML نصي فقط (بدون صور — أسرع)</option>
+  </select>
+  <label>اختر الملف:</label>
+  <input type="file" id="file" accept=".mht,.mhtml,.eml">
+  <button id="go" disabled>تحويل وتنزيل</button>
+  <div id="status" class="status"></div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const status = (msg, cls) => { const s=$('status'); s.className='status '+cls; s.textContent=msg; };
+
+$('file').addEventListener('change', () => { $('go').disabled = !$('file').files[0]; });
+$('go').addEventListener('click', async () => {
+  const f = $('file').files[0];
+  if (!f) return;
+  $('go').disabled = true;
+  status('جاري التحويل…', 'info');
+  try {
+    const buf = await f.arrayBuffer();
+    const text = new TextDecoder('latin1').decode(buf); // قراءة خام byte-preserving
+    const out = convertMHT(text, $('mode').value);
+    const blob = new Blob([out], {type:'text/html;charset=utf-8'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = f.name.replace(/\.(mht|mhtml|eml)$/i,'') + '.html';
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url), 5000);
+    status('تم التنزيل بنجاح ✓', 'ok');
+  } catch (e) {
+    console.error(e);
+    status('خطأ: ' + e.message, 'err');
+  } finally {
+    $('go').disabled = false;
+  }
+});
+
+// ===== فك التشفير مع دعم UTF-8 وترميزات قديمة =====
+function decodeBytes(bytes, charsetHint, isHtml) {
+  // BOM
+  if (bytes.length >= 3 && bytes[0]===0xEF && bytes[1]===0xBB && bytes[2]===0xBF)
+    return new TextDecoder('utf-8').decode(bytes.subarray(3));
+  if (bytes.length >= 2 && bytes[0]===0xFF && bytes[1]===0xFE)
+    return new TextDecoder('utf-16le').decode(bytes.subarray(2));
+  if (bytes.length >= 2 && bytes[0]===0xFE && bytes[1]===0xFF)
+    return new TextDecoder('utf-16be').decode(bytes.subarray(2));
+
+  const tryCs = (cs) => {
+    if (!cs) return null;
+    try { return new TextDecoder(cs.trim().toLowerCase()).decode(bytes); } catch { return null; }
+  };
+
+  // 1) charset من الهيدر
+  let r = tryCs(charsetHint);
+  if (r !== null) return r;
+
+  // 2) لو HTML: استخرج charset من <meta>
+  if (isHtml) {
+    const head = new TextDecoder('latin1').decode(bytes.subarray(0, Math.min(bytes.length, 4096)));
+    const m = head.match(/charset\s*=\s*["']?([^"'\s/>;]+)/i);
+    if (m) {
+      r = tryCs(m[1]);
+      if (r !== null) return r;
+    }
+  }
+
+  // 3) UTF-8 صارم (يرفض لو التسلسل غلط)
+  try { return new TextDecoder('utf-8', {fatal:true}).decode(bytes); } catch {}
+
+  // 4) ترميزات قديمة شائعة (عربي/غربي)
+  for (const cs of ['windows-1256','windows-1252','iso-8859-6','latin1']) {
+    r = tryCs(cs);
+    if (r !== null) return r;
+  }
+  return new TextDecoder('utf-8').decode(bytes);
+}
+
+function convertMHT(text, mode) {
+  const bm = text.match(/boundary\s*=\s*"?([^"\r\n;]+)"?/i);
+  if (!bm) throw new Error('ملف MHT غير صالح: لا يوجد boundary');
+  const boundary = bm[1].trim();
+
+  const rawParts = text.split('--' + boundary);
+  const resources = new Map();
+  let htmlText = null;
+
+  for (let p of rawParts) {
+    p = p.replace(/^(\r?\n)+/, '');
+    if (p.startsWith('--') || !p.trim()) continue;
+
+    const split = p.search(/\r?\n\r?\n/);
+    if (split === -1) continue;
+    const sep = p.substring(split).match(/^\r?\n\r?\n/)[0];
+    const headerText = p.substring(0, split);
+    let body = p.substring(split + sep.length).replace(/\r?\n$/, '');
+
+    const headers = {};
+    let key = null;
+    for (const line of headerText.split(/\r?\n/)) {
+      if (/^[ \t]/.test(line) && key) headers[key] += ' ' + line.trim();
+      else { const m = line.match(/^([^:]+):\s*(.*)$/); if (m){ key=m[1].toLowerCase(); headers[key]=m[2]; } }
+    }
+
+    const ct = (headers['content-type'] || '').toLowerCase();
+    const enc = (headers['content-transfer-encoding'] || '').toLowerCase().trim();
+    const loc = (headers['content-location'] || '').trim();
+    const mime = ct.split(';')[0].trim() || 'application/octet-stream';
+    const cm = ct.match(/charset\s*=\s*"?([^";\s]+)"?/);
+    const charset = cm ? cm[1] : null;
+
+    // فك إلى bytes
+    let bytes;
+    if (enc === 'base64') {
+      const clean = body.replace(/[^A-Za-z0-9+/=]/g, '');
+      const bin = atob(clean);
+      bytes = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
+    } else if (enc === 'quoted-printable') {
+      const dec = body.replace(/=\r?\n/g,'').replace(/=([0-9A-F]{2})/gi,(_,h)=>String.fromCharCode(parseInt(h,16)));
+      bytes = new Uint8Array(dec.length);
+      for (let i=0;i<dec.length;i++) bytes[i] = dec.charCodeAt(i) & 0xff;
+    } else {
+      // 🔧 الإصلاح: تحويل latin1 → bytes مباشرة (كان TextEncoder بيبوّظ UTF-8)
+      bytes = new Uint8Array(body.length);
+      for (let i=0;i<body.length;i++) bytes[i] = body.charCodeAt(i) & 0xff;
+    }
+
+    if (mime === 'text/html' && htmlText === null) {
+      htmlText = decodeBytes(bytes, charset, true);
+    }
+
+    if (loc && (mime.startsWith('image/') || mime.includes('css') || mime.includes('javascript') || mime.startsWith('font/'))) {
+      let bin = '';
+      for (let i=0;i<bytes.length;i+=8192) bin += String.fromCharCode.apply(null, bytes.subarray(i,i+8192));
+      resources.set(loc, { mime, dataUrl: `data:${mime};base64,${btoa(bin)}` });
+    }
+  }
+
+  if (htmlText === null) throw new Error('لم يتم العثور على HTML داخل الملف');
+  if (mode === 'plain' || resources.size === 0) return ensureUtf8Meta(htmlText);
+
+  const doc = new DOMParser().parseFromString(htmlText, 'text/html');
+  const lookup = new Map();
+  for (const [loc, r] of resources) {
+    lookup.set(loc, r.dataUrl);
+    const file = loc.split('/').pop().split('?')[0];
+    if (file) lookup.set(file, r.dataUrl);
+    try { lookup.set(decodeURIComponent(loc), r.dataUrl); } catch {}
+  }
+  const resolve = url => {
+    if (!url || url.startsWith('data:') || url.startsWith('http')) return null;
+    if (lookup.has(url)) return lookup.get(url);
+    const file = url.split('/').pop().split('?')[0];
+    return lookup.get(file) || null;
+  };
+
+  for (const el of doc.querySelectorAll('[src],[href],[poster]')) {
+    for (const attr of ['src','href','poster']) {
+      const u = el.getAttribute(attr);
+      const d = u && resolve(u);
+      if (d) el.setAttribute(attr, d);
+    }
+  }
+  for (const el of doc.querySelectorAll('[style]')) {
+    const st = el.getAttribute('style');
+    if (st.includes('url(')) {
+      el.setAttribute('style', st.replace(/url\(["']?([^"')]+)["']?\)/g, (m,u) => {
+        const d = resolve(u); return d ? `url("${d}")` : m;
+      }));
+    }
+  }
+  for (const el of doc.querySelectorAll('style')) {
+    el.textContent = el.textContent.replace(/url\(["']?([^"')]+)["']?\)/g, (m,u) => {
+      const d = resolve(u); return d ? `url("${d}")` : m;
+    });
+  }
+
+  return ensureUtf8Meta('<!DOCTYPE html>\n' + doc.documentElement.outerHTML);
+}
+
+// ضمان إن الناتج UTF-8
+function ensureUtf8Meta(html) {
+  if (/<meta[^>]+charset\s*=\s*["']?utf-8/i.test(html)) return html;
+  html = html.replace(/<meta[^>]+charset[^>]*>/gi, '');
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head[^>]*>/i, m => m + '\n<meta charset="UTF-8">');
+  }
+  return '<meta charset="UTF-8">\n' + html;
+}
+</script>
+</body>
+</html>
+
